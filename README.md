@@ -4,11 +4,11 @@
 
 ## 1. Team Information
 
-* Team Member 1: Qamar Ahmed
-* SRN: PES2UG24CS904
+* Team Member 1: Ibrahim khaleel
+* SRN: PES2UG24CS809
 
-* Team Member 2: Joshwin Paul
-* SRN: PES2UG24CS208
+* Team Member 2: Deeraj S
+* SRN: PES2UG24CS806
 
 ---
 
