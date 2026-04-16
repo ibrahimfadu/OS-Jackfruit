@@ -34,7 +34,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
+#include <sys/resource.h>
 #include "monitor_ioctl.h"
 
 #define STACK_SIZE (1024 * 1024)
@@ -68,12 +68,15 @@ typedef enum {
 typedef struct container_record {
     char id[CONTAINER_ID_LEN];
     pid_t host_pid;
+    char rootfs[PATH_MAX];
     time_t started_at;
     container_state_t state;
     unsigned long soft_limit_bytes;
     unsigned long hard_limit_bytes;
+    int stop_requested;
     int exit_code;
     int exit_signal;
+    int log_read_fd;
     char log_path[PATH_MAX];
     struct container_record *next;
 } container_record_t;
@@ -127,6 +130,100 @@ typedef struct {
     pthread_mutex_t metadata_lock;
     container_record_t *containers;
 } supervisor_ctx_t;
+
+static volatile sig_atomic_t g_supervisor_stop = 0;
+static volatile sig_atomic_t g_sigchld_pending = 0;
+
+static void handle_sigchld(int signo)
+{
+    (void)signo;
+    g_sigchld_pending = 1;
+}
+
+static void handle_terminate(int signo)
+{
+    (void)signo;
+    g_supervisor_stop = 1;
+}
+
+static int install_supervisor_signal_handlers(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+
+    sa.sa_handler = handle_sigchld;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa, NULL) < 0)
+        return -1;
+
+    sa.sa_handler = handle_terminate;
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGINT, &sa, NULL) < 0)
+        return -1;
+    if (sigaction(SIGTERM, &sa, NULL) < 0)
+        return -1;
+
+    return 0;
+}
+
+static container_record_t *find_container_by_pid(supervisor_ctx_t *ctx, pid_t pid)
+{
+    container_record_t *cur = ctx->containers;
+
+    while (cur) {
+        if (cur->host_pid == pid)
+            return cur;
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+static void free_container_list(container_record_t *head)
+{
+    container_record_t *cur = head;
+    while (cur) {
+        container_record_t *next = cur->next;
+        if (cur->log_read_fd >= 0)
+            close(cur->log_read_fd);
+        free(cur);
+        cur = next;
+    }
+}
+
+static void reap_children(supervisor_ctx_t *ctx)
+{
+    int status;
+    pid_t pid;
+
+    for (;;) {
+        container_record_t *rec = NULL;
+
+        pid = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0)
+            break;
+
+        pthread_mutex_lock(&ctx->metadata_lock);
+        rec = find_container_by_pid(ctx, pid);
+        if (rec) {
+            if (WIFEXITED(status)) {
+                rec->state = CONTAINER_EXITED;
+                rec->exit_code = WEXITSTATUS(status);
+                rec->exit_signal = 0;
+            } else if (WIFSIGNALED(status)) {
+                rec->state = rec->stop_requested ? CONTAINER_STOPPED : CONTAINER_KILLED;
+                rec->exit_code = -1;
+                rec->exit_signal = WTERMSIG(status);
+            }
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        if (rec && ctx->monitor_fd >= 0)
+            unregister_from_monitor(ctx->monitor_fd, rec->id, rec->host_pid);
+    }
+}
+
 
 static void usage(const char *prog)
 {
@@ -338,8 +435,62 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
-    return 1;
+    child_config_t *cfg = (child_config_t *)arg;
+
+    if (!cfg)
+        _exit(127);
+
+    if (sethostname(cfg->id, strnlen(cfg->id, sizeof(cfg->id))) < 0) {
+        perror("sethostname");
+        _exit(127);
+    }
+
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        perror("mount private");
+        _exit(127);
+    }
+
+    if (chdir(cfg->rootfs) < 0) {
+        perror("chdir rootfs");
+        _exit(127);
+    }
+
+    if (chroot(".") < 0) {
+        perror("chroot");
+        _exit(127);
+    }
+
+    if (chdir("/") < 0) {
+        perror("chdir /");
+        _exit(127);
+    }
+
+    if (mkdir("/proc", 0555) < 0 && errno != EEXIST) {
+        perror("mkdir /proc");
+        _exit(127);
+    }
+
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
+        perror("mount /proc");
+        _exit(127);
+    }
+
+    if (cfg->nice_value != 0) {
+        if (setpriority(PRIO_PROCESS, 0, cfg->nice_value) < 0)
+            perror("setpriority");
+    }
+
+    if (dup2(cfg->log_write_fd, STDOUT_FILENO) < 0 ||
+        dup2(cfg->log_write_fd, STDERR_FILENO) < 0) {
+        perror("dup2");
+        _exit(127);
+    }
+    if (cfg->log_write_fd > STDERR_FILENO)
+        close(cfg->log_write_fd);
+
+    execl("/bin/sh", "sh", "-c", cfg->command, (char *)NULL);
+    perror("execl");
+    _exit(127);
 }
 
 int register_with_monitor(int monitor_fd,
@@ -391,6 +542,7 @@ static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
     int rc;
+    (void)rootfs;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.server_fd = -1;
@@ -411,22 +563,47 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
 
-    /*
-     * TODO:
-     *   1) open /dev/container_monitor
-     *   2) create the control socket / FIFO / shared-memory channel
-     *   3) install SIGCHLD / SIGINT / SIGTERM handling
-     *   4) spawn the logger thread
-     *   5) enter the supervisor event loop
-     */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+    if (mkdir(LOG_DIR, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir logs");
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0) {
+        perror("open /dev/container_monitor");
+        fprintf(stderr, "Continuing without kernel monitor for now.\n");
+    }
+
+    if (install_supervisor_signal_handlers() < 0) {
+        perror("install_supervisor_signal_handlers");
+        if (ctx.monitor_fd >= 0)
+            close(ctx.monitor_fd);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+
+    printf("Supervisor started (Task 1 loop active). Press Ctrl+C to stop.\n");
+    while (!g_supervisor_stop) {
+        if (g_sigchld_pending) {
+            g_sigchld_pending = 0;
+            reap_children(&ctx);
+        }
+        usleep(100000);
+    }
+
+    reap_children(&ctx);
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
+    if (ctx.monitor_fd >= 0)
+        close(ctx.monitor_fd);
+    free_container_list(ctx.containers);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
+    return 0;
 }
-
 /*
  * TODO:
  * Implement the client-side control request path.
